@@ -37,10 +37,10 @@
     "demo": "node demo.js",
     "crowd:demo": "node crowd-sim/inference.js",
     "build": "electron-builder",
-    "pkg:mac:arm64": "pkg cosmic.js --targets node18-macos-arm64 --output build/cosmic-darwin-arm64",
-    "pkg:mac:x64": "pkg cosmic.js --targets node18-macos-x64 --output build/cosmic-darwin-x64",
+    "pkg:mac:arm64": "pkg cosmic.cjs --targets node18-macos-arm64 --output build/cosmic-darwin-arm64",
+    "pkg:mac:x64": "pkg cosmic.cjs --targets node18-macos-x64 --output build/cosmic-darwin-x64",
     "pkg:mac": "npm run pkg:mac:arm64 && npm run pkg:mac:x64",
-    "pkg:linux": "pkg cosmic.js --targets node18-linux-x64 --output build/cosmic-linux-x64",
+    "pkg:linux": "pkg cosmic.cjs --targets node18-linux-x64 --output build/cosmic-linux-x64",
     "pkg:all": "npm run pkg:mac && npm run pkg:linux"
   },
   "keywords": [
