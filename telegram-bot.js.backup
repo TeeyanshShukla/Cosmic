@@ -1,0 +1,417 @@
+/**
+ * 🤖 Telegram Bot for AI Computer Agent
+ * 
+ * Features:
+ * - Execute commands on your agent
+ * - Retrieve files from your Mac
+ * - Send documents via Telegram
+ * - Real-time feedback
+ */
+
+import TelegramBot from 'node-telegram-bot-api';
+import { execSync, execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import runAgent from './agent-v3.mjs';
+import { tools } from './tools.mjs';
+
+// Escape special characters for Telegram messages
+const escapeMarkdown = (text) => {
+    if (!text) return '';
+    return String(text)
+        .replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+};
+
+// Load environment
+const token = process.env.TELEGRAM_BOT_TOKEN;
+if (!token) {
+    console.error('❌ TELEGRAM_BOT_TOKEN not set in .env');
+    process.exit(1);
+}
+
+const bot = new TelegramBot(token, { polling: true });
+const ADMIN_IDS = (process.env.TELEGRAM_ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+
+console.log('🤖 Telegram Bot Starting...');
+console.log(`✅ Admin IDs: ${ADMIN_IDS.join(', ')}`);
+
+// Debug: Log all messages
+bot.on('message', (msg) => {
+    console.log(`📬 Message received from ${msg.chat.id} (${msg.from?.username || 'unknown'}): ${msg.text || '[non-text]'}`);
+});
+
+// ============================================
+// 1. COMMAND EXECUTION
+// ============================================
+
+bot.onText(/\/run (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized to execute commands');
+    }
+
+    const command = match[1];
+    console.log(`\n📝 Command received: "${command}"`);
+    
+    await bot.sendMessage(chatId, `⏳ Executing: "${command}"\n\nLet me start the agent...`);
+
+    try {
+        let loopCount = 0;
+        const MAX_STEPS = 20; // 🛑 Loop safety limit
+        let running = true;
+        let lastResult = null;
+
+        while (running && loopCount < MAX_STEPS) {
+            loopCount++;
+            console.log(`🔄 Agent Loop #${loopCount} for: "${command}"`);
+
+            // Execute one step
+            const result = await runAgent(command);
+            lastResult = result;
+
+            // Check if done
+            if (result.stop) {
+                running = false;
+                await bot.sendMessage(chatId, 
+                    `✅ Task completed successfully!\n\n` +
+                    `Result: ${escapeMarkdown(result.result || 'Done')}`,
+                    { reply_to_message_id: msg.message_id }
+                );
+            } else if (result.error) {
+                // If there's an error but we might want to continue... usually we stop on error
+                // But let's log it. if runAgent returns stop:false on error, we might be stuck?
+                // runAgent returns { stop: false, error: ... } on catch.
+                // We should probably stop if there is an error to be safe, or retry?
+                // For now, let's stop on explicit error.
+                running = false;
+                await bot.sendMessage(chatId, 
+                    `❌ Task stopped due to error\n\n` +
+                    `Error: ${escapeMarkdown(result.error)}`,
+                    { reply_to_message_id: msg.message_id }
+                );
+            } else {
+                // Task is still running (stop: false, no error)
+                // Optionally send update, but maybe too spammy?
+                // Let's just log to console.
+                console.log(`➡️ Step ${loopCount} complete. Continuing...`);
+            }
+        }
+
+        if (loopCount >= MAX_STEPS && running) {
+             await bot.sendMessage(chatId, 
+                `⚠️ Task stopped: Max steps (${MAX_STEPS}) reached.\n\n` +
+                `The agent might still be working or stuck.`,
+                { reply_to_message_id: msg.message_id }
+            );
+        }
+
+    } catch (error) {
+        console.error('❌ Command error:', error.message);
+        await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`);
+    }
+});
+
+// ============================================
+// 2. FILE SEARCH & RETRIEVAL
+// ============================================
+
+bot.onText(/\/find (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized');
+    }
+
+    const filename = match[1];
+    console.log(`🔍 Searching for: "${filename}"`);
+    
+    await bot.sendMessage(chatId, `🔍 Searching for: "${filename}"\nThis may take a moment...`);
+
+    try {
+        // Use macOS 'mdfind' (Spotlight) to find files
+        const result = execSync(`mdfind -name "${filename}" -type f`, { encoding: 'utf-8' });
+        const files = result.trim().split('\n').filter(f => f);
+
+        if (files.length === 0) {
+            return bot.sendMessage(chatId, `❌ No files found matching "${filename}"`);
+        }
+
+        const fileList = files.slice(0, 10)  // Limit to 10 results
+            .map((f, i) => `${i+1}. ${f}`)
+            .join('\n');
+
+        await bot.sendMessage(chatId, 
+            `✅ Found ${files.length} file(s):\n\n${fileList}\n\n` +
+            `Use: /get <file_path>\nExample: /get ${files[0]}`
+        );
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Search error: ${escapeMarkdown(error.message)}`);
+    }
+});
+
+// ============================================
+// 3. SEND FILE VIA TELEGRAM
+// ============================================
+
+bot.onText(/\/get (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized');
+    }
+
+    const filepath = match[1].trim();
+    console.log(`📥 Requesting file: "${filepath}"`);
+
+    // Security check - prevent path traversal
+    const homedir = os.homedir();
+    const resolvedPath = path.resolve(filepath);
+    
+    if (!resolvedPath.startsWith(homedir)) {
+        return bot.sendMessage(chatId, '❌ Access denied - can only access files in home directory');
+    }
+
+    try {
+        if (!fs.existsSync(filepath)) {
+            return bot.sendMessage(chatId, `❌ File not found: ${filepath}`);
+        }
+
+        const stats = fs.statSync(filepath);
+        
+        // File size limit (100MB)
+        if (stats.size > 100 * 1024 * 1024) {
+            return bot.sendMessage(chatId, `❌ File too large (${formatSize(stats.size)}). Max: 100MB`);
+        }
+
+        await bot.sendMessage(chatId, `📤 Sending: ${path.basename(filepath)} (${formatSize(stats.size)})`);
+        
+        // Send as document
+        await bot.sendDocument(chatId, filepath, {
+            caption: `📄 ${path.basename(filepath)}`
+        });
+
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error sending file: ${escapeMarkdown(error.message)}`);
+    }
+});
+
+// ============================================
+// 4. SPECIAL: GET AI NOTES
+// ============================================
+
+bot.onText(/\/notes/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized');
+    }
+
+    console.log('📝 Searching for AI notes...');
+    await bot.sendMessage(chatId, '🔍 Searching for AI notes in your Mac...');
+
+    try {
+        // Search in common locations
+        const searchPaths = [
+            '~/Documents/AI_Notes',
+            '~/Documents/notes',
+            '~/Desktop/notes',
+            '~/Desktop/AI',
+            '~/Notes'
+        ];
+
+        const foundFiles = [];
+
+        for (const searchPath of searchPaths) {
+            const expandedPath = path.expand(searchPath.replace('~', os.homedir()));
+            try {
+                if (fs.existsSync(expandedPath)) {
+                    const files = fs.readdirSync(expandedPath)
+                        .filter(f => f.endsWith('.txt') || f.endsWith('.md') || f.endsWith('.pdf') || f.endsWith('.doc') || f.endsWith('.docx'))
+                        .map(f => path.join(expandedPath, f));
+                    foundFiles.push(...files);
+                }
+            } catch (e) {
+                // Continue searching other paths
+            }
+        }
+
+        if (foundFiles.length === 0) {
+            return bot.sendMessage(chatId, 
+                `❌ No AI notes found\n\n` +
+                `Common locations checked:\n` +
+                searchPaths.map(p => `• ${p}`).join('\n')
+            );
+        }
+
+        const fileList = foundFiles.slice(0, 5)
+            .map((f, i) => `${i+1}. ${path.basename(f)} (${formatSize(fs.statSync(f).size)})`)
+            .join('\n');
+
+        await bot.sendMessage(chatId,
+            `✅ Found ${foundFiles.length} note file(s):\n\n${fileList}\n\n` +
+            `Use: /get <full_path>\n` +
+            `To get the full path: /find AI_Notes`
+        );
+
+        // Send first 3 files automatically if small enough
+        for (let i = 0; i < Math.min(3, foundFiles.length); i++) {
+            const fileSize = fs.statSync(foundFiles[i]).size;
+            if (fileSize < 5 * 1024 * 1024) {  // Under 5MB
+                try {
+                    await bot.sendDocument(chatId, foundFiles[i], {
+                        caption: `📄 ${path.basename(foundFiles[i])}`
+                    });
+                } catch (e) {
+                    console.error(`Failed to send ${foundFiles[i]}:`, e.message);
+                }
+            }
+        }
+
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`);
+    }
+});
+
+// ============================================
+// 5. SCREENSHOT
+// ============================================
+
+bot.onText(/\/screenshot/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized');
+    }
+
+    console.log('📸 Taking screenshot...');
+    await bot.sendMessage(chatId, '📸 Taking screenshot...');
+
+    try {
+        const result = await tools.take_screenshot();
+        const screenshotPath = path.join(os.tmpdir(), 'agent_screen.png');
+        
+        if (fs.existsSync(screenshotPath)) {
+            await bot.sendPhoto(chatId, screenshotPath, {
+                caption: '📸 Current screen'
+            });
+        } else {
+            await bot.sendMessage(chatId, '❌ Failed to capture screenshot');
+        }
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`);
+    }
+});
+
+// ============================================
+// 6. HELP COMMAND
+// ============================================
+
+bot.onText(/\/help/, (msg) => {
+    const chatId = msg.chat.id;
+    const helpText = `
+🤖 **AI Computer Agent Bot**
+
+**Commands:**
+
+📝 *Execute Tasks*
+/run <command> - Run agent with custom goal
+Example: /run Search on Google: What is AI
+
+📂 *File Operations*
+/find <filename> - Search for files
+/get <filepath> - Send file via Telegram
+/notes - Get AI notes automatically
+
+📸 *System*
+/screenshot - Take current screen screenshot
+/help - Show this help
+
+**Examples:**
+• /run Open Spotify and search Yoyo Honey Singh
+• /find AI_Notes
+• /notes
+• /screenshot
+
+⚠️ Only authorized users can use these commands.
+    `;
+    bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
+});
+
+// ============================================
+// 7. START COMMAND
+// ============================================
+
+bot.onText(/\/start/, (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId,
+        '🤖 Welcome to AI Computer Agent!\n\n' +
+        'Send /help for available commands\n' +
+        'Your Chat ID: `' + chatId + '`',
+        { parse_mode: 'Markdown' }
+    );
+});
+
+// ============================================
+// UTILITIES
+// ============================================
+
+function isAuthorized(msg) {
+    if (ADMIN_IDS.length === 0) return true;  // No restrictions if not set
+    return ADMIN_IDS.includes(String(msg.from.id));
+}
+
+function formatSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+}
+
+// Expand ~ to home directory
+Object.defineProperty(String.prototype, 'expand', {
+    value: function() {
+        return this.replace('~', os.homedir());
+    }
+});
+
+// ============================================
+// ERROR HANDLING
+// ============================================
+
+bot.on('polling_error', (error) => {
+    console.error('❌ Polling error:', error.message);
+});
+
+process.on('SIGINT', () => {
+    console.log('\n👋 Bot shutting down...');
+    bot.stopPolling();
+    process.exit(0);
+});
+
+console.log('✅ Telegram Bot is running!');
+console.log('📝 Waiting for commands...\n');
+
+// ============================================
+// 8. WAKEUP/UNLOCK MAC
+// ============================================
+
+bot.onText(/\/wakeup/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!isAuthorized(msg)) {
+        return bot.sendMessage(chatId, '❌ Not authorized');
+    }
+
+    console.log('⏰ Waking and unlocking Mac...');
+    await bot.sendMessage(chatId, '⏰ Waking and unlocking Mac...');
+
+    try {
+        // Wake Mac from sleep
+        execSync('caffeinate -u -t 1', { stdio: 'inherit' });
+        
+        // Unlock Mac with password (no space before password)
+        execSync('osascript -e "tell application \\"System Events\\" to keystroke \\"14897\\" & key code 36"', { stdio: 'inherit' });
+        
+        await bot.sendMessage(chatId, '✅ Mac woken and unlocking...');
+    } catch (error) {
+        console.error('Wakeup error:', error.message);
+        await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`);
+    }
+});

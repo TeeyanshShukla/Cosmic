@@ -1,0 +1,892 @@
+import { GoogleGenAI } from "@google/genai";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import dotenv from "dotenv";
+import tools from "./tools.mjs";
+import memory from "./memory.mjs";
+
+dotenv.config();
+
+const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY
+});
+
+// ⚙️ CONFIGURATION CONSTANTS
+const CONFIG = {
+    MAX_RETRIES: 3,
+    BASE_DELAY: 1000,
+    MODEL_NAME: "gemini-3-flash-preview",
+    JITTER_THRESHOLD_PX: 15,
+    LOOP_DETECTION_RADIUS_PX: 50,
+    ACTION_HISTORY_LIMIT: 20,
+    SPOTLIGHT_DELAY_MS: 1200,
+    SCREENSHOT_DELAY_MS: 500,
+    HTTP_OVERLOAD_STATUS: 503
+};
+
+// 🔄 RETRY HELPER FUNCTION
+async function retryWithBackoff(apiCall, maxRetries = CONFIG.MAX_RETRIES, baseDelay = CONFIG.BASE_DELAY) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await apiCall();
+        } catch (error) {
+            if (error.code === CONFIG.HTTP_OVERLOAD_STATUS || error.message?.includes('overloaded')) {
+                if (attempt === maxRetries) {
+                    throw new Error(`Gemini API overloaded after ${maxRetries} attempts. Please try again in a few minutes.`);
+                }
+
+                const delay = baseDelay * Math.pow(2, attempt - 1);
+                console.log(`⏳ Gemini API overloaded (attempt ${attempt}/${maxRetries}). Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                throw error;
+            }
+        }
+    }
+}
+
+// 🔒 GLOBAL STATE TRACKING FOR PROTOCOL ENFORCEMENT
+let lastActionType = null;
+let lastActionArgs = null;
+let actionHistory = [];
+
+// [FIX] Reset memory at module load/start
+memory.resetSession();
+
+const PLANNER_PROMPT = `You are a computer action planner. Analyze the screenshot and output the next action.
+
+CRITICAL: You must output a valid JSON object.
+Format:
+{"action": "ACTION_NAME", "args": {"param": value}}
+OR for actions with no args (like click):
+{"action": "click", "args": {}}
+
+MANDATORY HONESTY PROTOCOL - NO LYING ALLOWED:
+
+1. SCREENSHOT ANALYSIS PROTOCOL:
+   - You MUST actually look at and analyze the screenshot
+   - You MUST be completely honest about what you see
+   - NEVER claim something is true if you cannot clearly see it
+   - NEVER use the same coordinates repeatedly if they don't work
+
+2. MAC SHORTCUT PRIORITY PROTOCOL:
+   - The user is on MacOS.
+   - ALWAYS prefer keyboard shortcuts over mouse actions and clicks.
+   - Shortcut Discovery: 
+     - If you clearly know the shortcut, USE IT.
+     - If you are UNSURE, use the 'find_shortcuts' tool.
+     - Example: {"action": "find_shortcuts", "args": {"app_name": "Spotify", "intention": "Shuffle"}}
+     - AFTER finding the shortcut, use 'key_combo'.
+   - If 'find_shortcuts' returns NOT_FOUND, then use the mouse.
+
+3. SPOTLIGHT SEARCH PROTOCOL (INITIAL LAUNCH ONLY):
+   - USE SPOTLIGHT ONLY TO OPEN APPS/BROWSERS.
+   - **SEQUENCE**:
+     1. Action: 'key_combo', args: '{"keys": "LeftCmd+Space"}'.
+     2. Action: 'key', args: '{"key": "space"}'.
+     3. Action: 'type', args: '{"text": "YourSearchTerm"}'.
+     4. Action: 'key', args: '{"key": "enter"}'.
+   - LOOK at the search results below the bar.
+   - IF the desired App/File IS FOUND -> Press Enter.
+   - **IF THE APP IS NOT FOUND -> PRESS "cmd+b" IMMEDIATELY.** (This searches the web).
+   - CRITICAL: DO NOT PRESS ENTER IF THE APP IS NOT FOUND.
+
+4. BROWSER & TAB NAVIGATION PROTOCOL:
+   - When in a web browser (Chrome, Safari, etc.):
+   - Use SHORTCUTS for navigation:
+     - "cmd+t": New Tab
+     - "cmd+l": Jump to Address Bar (for typing URL or Search)
+     - "cmd+w": Close Tab
+     - "cmd+r": Reload
+     - "cmd+shift+]": Next Tab
+     - "cmd+shift+[": Previous Tab
+   - DO NOT use Spotlight to search if you are already in a browser. Use "cmd+l" instead.
+
+5. STRICT MOUSE SYNTAX (NO COORDINATE CLICKS):
+   - **CRITICAL**: The 'click' tool DOES NOT accept coordinates.
+   - **INVALID**: 'click(x, y)' will result in a SYNTAX WARNING.
+   - **CORRECT FLOW**:
+     1. 'move(x, y)' -> Moves cursor to target.
+     2. **VERIFY** -> Check screenshot.
+     3. 'click' (NO ARGS) -> Clicks at current position.
+   - **NEVER** try to combine move and click in one command.
+
+6. NAVIGATION & SCROLLING PROTOCOL:
+   - **MANDATORY**: Use KEYBOARD "pageup" or "pagedown" keys for scrolling.
+   - To scroll down: Use "key" with "pagedown".
+   - To scroll up: Use "key" with "pageup".
+   - **FORBIDDEN**: Do NOT use "down" or "up" arrow keys for scrolling (too slow).
+   - **ALWAYS SCROLL** if the content or target element is not fully visible in the current screenshot.
+   - For navigating between inputs or buttons:
+     - PREFER using "key" with "tab" (or "shift+tab" for reverse).
+   - ONLY use the mouse/scroll tool if keyboard navigation is completely ineffective.
+
+7. SOCIAL MEDIA / LIST CONTENT PROTOCOL:
+   - **IDENTIFYING LATEST POSTS**:
+     - LOOK for "Pinned" icons or text (often near the top).
+     - IGNORE pinned posts when asked for the "latest" or "newest" post.
+     - The "Latest" post is the FIRST post that appears *after* any pinned posts.
+     - If you are unsure, scroll down slightly to reveal the non-pinned feed.
+
+8. COORDINATE VARIATION PROTOCOL:
+   - If the verification step shows the mouse is NOT at the desired location:
+   - KEEP CHANGING DIMENSIONS (X, Y) under the "move" function.
+   - Do NOT just repeat the same coordinates.
+   - **Visual Correction**: Calculate the offset based on where the cursor ended up vs. where it needs to go.
+   - Continue "move" and "verify" loop until the location is reached.
+
+9. HONESTY VERIFICATION PROTOCOL:
+   - After EVERY action, be completely honest about the results
+   - If you cannot see the cursor in the search box, admit it and try different coordinates
+   - NEVER claim success unless you can genuinely see it in the screenshot
+   - If previous coordinates failed, ALWAYS try different ones
+   - Be truthful about what you observe in the screenshot
+
+ALLOWED ACTIONS (use exact names):
+- move: Move mouse to coordinates (use DIFFERENT coordinates each time if previous failed)
+- click: Click at CURRENT position. ARGS MUST BE EMPTY: "args": {}
+- type: Type text (only after verifying input field is active)
+- scroll: Scroll (Only if keyboard fails)
+- wait: Wait milliseconds or seconds (use for honest verification)
+- key: Press single key (LeftCmd+Space, enter, tab, escape, backspace, space, pagedown, pageup)
+- key_combo: Press key combinations
+- find_shortcuts: Look up a shortcut. ARGS: {"app_name": "Name", "intention": "Action"}
+- stop: Task completed successfully
+- ask_user: Ask the user for missing information. ARGS: {"question": "Question text"}
+
+EXAMPLES (CORRECT USAGE):
+
+{"action": "key_combo", "args": {"keys": "LeftCmd+Space"}}
+
+// WRONG: {"action": "click", "args": {"x": 640, "y": 140}} -> SYNTAX ERROR
+
+// CORRECT (Two Steps):
+// Step 1: Move & Verify
+{"action": "move", "args": {"x": 640, "y": 140}} 
+
+// Step 2: Click (No Args)
+{"action": "click", "args": {}}
+
+{"action": "type", "args": {"text": "Hello"}}
+
+CRITICAL PROMPT REMINDER:
+- PRIORITIZE SHORTCUTS first.
+- SCROLL USING PAGEUP/PAGEDOWN KEYS.
+
+CRITICAL HONESTY RULES:
+- NEVER repeat failed coordinates - always try different X,Y values
+- NEVER claim cursor is inside the search box unless you can clearly see it
+- ALWAYS vary coordinates by at least 20 pixels when repositioning
+   - NEVER use "wait" to confirm position unless cursor is genuinely visible inside the search box
+   - If you cannot see the cursor inside the search box, use "move" with DIFFERENT coordinates
+   - Be completely honest about what you observe in the screenshot
+   - Try multiple different coordinate combinations until you find one that works
+   - The search box is usually in the upper-center area of the screen
+   - You MAY provide brief reasoning before the JSON block.
+   - HONESTY IS MANDATORY - no false claims about cursor position
+
+10. CONTEXT AWARENESS:
+   - You will receive CONTEXT about previous steps.
+   - If previous moves failed, analyze WHY (e.g., "was too high", "was too far left").
+   - **CRITICAL**: BEFORE generating JSON, you MUST write a short "THOUGHT PROCESS".
+   - **Step 1**: Identify the User's Goal.
+   - **Step 2**: Analyze the Screenshot. Where is the target?
+   - **Step 3**: coordinate Sanity Check.
+     - Is X < 250? (Sidebar Danger Zone).
+     - Is it a Pinned Post? (Ignore it).
+   - **Step 4**: Select Tool.
+   - **Step 5**: FINAL JSON.
+
+   **EXAMPLE OUTPUT**:
+   Thinking: "The user wants to click search. Cmd+K is the standard shortcut. I will try that first."
+   ```json
+   {"action": "key_combo", "args": {"keys": "cmd+k"}} 
+   ```
+
+10. LOOP PREVENTION:
+   - Your history is provided.
+   - If previous actions failed, try a DIFFERENT approach (e.g., Tab key, or drastically different coordinates).
+   - If you see "Jitter Guard" in history, it means you moved too small. MOVE FURTHER next time.
+
+11. PRIMARY PROTOCOL: KEYBOARD SUPERIORITY
+   - **RULE**: ALWAYS check if a Keyboard Shortcut exists BEFORE planning a mouse move.
+   - **Reason**: Mouse coordinates are fragile. Shortcuts (LeftCmd+K, LeftCmd+L, Space, Enter) are robust.
+   - **Checklist**:
+     - Search? -> LeftCmd+K / LeftCmd+F / LeftCmd+Space
+     - Address Bar? -> LeftCmd+L
+     - Refresh? -> LeftCmd+R
+     - Navigation? -> Arrow Keys / Tab
+   - **ONLY** use "move" + "click" if you are certain no shortcut exists.
+
+12. LAST RESORT (TAB FALLBACK):
+   - If shortcuts fail, and mouse fails, try Tab.
+     1. Output: '{"action": "key", "args": {"key": "tab"}}'
+     2. Repeat "tab" until you see the target element HIGHLIGHTED (usually a blue border or focus ring).
+     3. Once highlighted, Output: '{"action": "key", "args": {"key": "enter"}}'
+   - **VERIFIER ROLE**: The Verifier will guide you. If it says "Use Tab", OBEY IMMEDIATELY.
+`;
+
+// 🕵️ VERIFIER SYSTEM PROMPT (Quality Assurance)
+const VERIFIER_PROMPT = `You are a supervisor AI (Quality Assurance). Your job is to VERIFY the proposed action from the "Planner" agent.
+
+INPUTS:
+1. User Goal
+2. Screenshot of the current screen
+3. Proposed Action (JSON)
+
+YOUR RESPONSIBILITIES:
+1. **LOGIC CHECK (PINNED POSTS)**:
+   - **CRITICAL RULE**: If the user wants "latest" or "newest", **NEVER** click a Pinned Post.
+   - **INSPECTION**: Look at the top row. Do they have a "Pin" icon (📌) or "Pinned" text?
+   - **REJECTION**: If the coordinates target a Pinned Post, **REJECT** the plan immediately.
+   - **REASONING**: "User wants latest post. First 3 posts are Pinned. Target must be the 4th post."
+   - **ABSOLUTE BAN**: Do NOT accept "it is standard to click the first post". Pinned posts are OLD. 
+   - **VERDICT**: If it is Pinned -> REJECT.
+
+2. **COORDINATE SANITY CHECK (CRITICAL)**:
+   - **SIDEBAR GUARD**: The Left Sidebar (Instagram/Twitter) is typically X < 250px.
+     - **IF** the User Goal is to click a "Post", "Picture", "Comment", or "Feed Item":
+     - **AND** proposed X coordinate is < 250 (e.g., 40, 50, 100):
+     - **THEN** REJECT IMMEDIATELY.
+     - **REASON**: "You are clicking the Sidebar. The feed is in the CENTER. You need to verify the content location."
+     - **CORRECTION**: Suggest a DRASTIC increase in X (e.g., X = 400 or 500). Do NOT suggest small changes.
+   - **GHOST CLICKING**: Does the target location actually contain a button/link? Or is it empty whitespace?
+   - **OFF-SCREEN**: Reject negative coordinates or coordinates larger than screen size.
+
+   - **OFF-SCREEN**: Reject negative coordinates or coordinates larger than screen size.
+
+3. **PROTOCOL: KEYBOARD OVER MOUSE**:
+   - **RULE**: If the user wants to Search, Refresh, or Navigate, and the Plan is "move"/"click", ASK: "Is there a shortcut?"
+   - **Examples**:
+     - Search (General) -> Suggest 'LeftCmd+Space' (Spotlight).
+     - Search (In-App) -> Suggest 'leftcmd+k' or 'leftcmd+f'.
+     - Refresh -> Suggest 'leftcmd+r'.
+     - Address Bar -> Suggest 'cmd+l'.
+   - **ACTION**: If a common shortcut exists, **REJECT or MODIFY** the plan to use 'key_combo'.
+   - **REASON**: "Keyboard shortcuts are more reliable than mouse clicks."
+
+4. **LOOP DETECTION & SHORTCUT ENFORCEMENT**:
+   - Does this action look exactly like a failed previous action?
+   - Has the Planner tried to "move" to the same approximate area 3 times without success?
+   - **IF YES**:
+     - **REJECT** the move.
+     - **REASON**: "Mouse positioning is failing (Loop detected)."
+     - **CORRECTION**: Suggest **KEYBOARD NAVIGATION** (Shortcuts first, then Tab).
+       - '{"action": "key", "args": {"key": "tab"}}'
+     - **EXPLANATION**: "Use SHORTCUTS or TAB to reach the target."
+
+OUTPUT FORMAT (JSON):
+{
+  "status": "APPROVED" | "REJECTED" | "MODIFIED",
+  "reason": "Brief explanation",
+  "correction": {"action": "...", "args": {...}} // Only if status is MODIFIED or REJECTED
+}
+**CRITICAL**: You MUST use the key "status". Do NOT use "answer", "decision", "verdict", or "evaluation". I will not understand them.
+If you mean "no", "incorrect", or "bad", you MUST set "status": "REJECTED".
+`;
+
+// 🕵️ VERIFIER FUNCTION
+async function verifyAction(userGoal, screenshot, proposedAction) {
+    try {
+        const response = await retryWithBackoff(async () => {
+            return await ai.models.generateContent({
+                model: CONFIG.MODEL_NAME,
+                systemInstruction: VERIFIER_PROMPT,
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                inlineData: {
+                                    mimeType: "image/png",
+                                    data: screenshot
+                                }
+                            },
+                            {
+                                text: `USER GOAL: ${userGoal}                            
+PROPOSED ACTION: ${JSON.stringify(proposedAction)}
+
+Verify this action. Return JSON.`
+                            }
+                        ]
+                    }
+                ]
+            });
+        });
+
+        const text = response.candidates[0].content.parts[0].text;
+        console.log("🕵️ Verifier says:", text);
+        let result = extractJSON(text);
+
+        // [NEW] SMART NORMALIZATION
+        // Fixes: Model returning {"answer": "no"} instead of {"status": "REJECTED"}
+        if (result) {
+            // 1. Map alternative keys to 'status'
+            if (!result.status) {
+                if (result.answer) result.status = result.answer;
+                if (result.decision) result.status = result.decision;
+                if (result.verdict) result.status = result.verdict;
+                if (result.evaluation) result.status = result.evaluation;
+            }
+
+            // 2. Map negative values to "REJECTED"
+            if (result.status) {
+                const s = String(result.status).toLowerCase();
+                if (s.includes("no") || s.includes("reject") || s.includes("false") || s.includes("bad") || s.includes("incorrect")) {
+                    result.status = "REJECTED";
+                } else if (s.includes("yes") || s.includes("approve") || s.includes("true") || s.includes("good") || s.includes("correct") || s.includes("pass") || s.includes("accept")) {
+                    result.status = "APPROVED";
+                }
+            } else {
+                // 3. Last Resort: Scan 'explanation' or 'reason' for negative words
+                const reason = (result.reason || result.explanation || "").toLowerCase();
+                if (reason.includes("wrong") || reason.includes("incorrect") || reason.includes("reject")) {
+                    result.status = "REJECTED";
+                }
+            }
+        }
+
+        return result;
+
+    } catch (error) {
+        console.error("⚠️ Verification system unavailable:", error.message);
+        console.error("   Proceeding with caution. Actual user action may differ from expectations.");
+        return { status: "APPROVED", reason: "Verifier unavailable, failing open." };
+    }
+}
+
+// 🧠 PLANNER - Analyzes screenshot and returns action plan
+async function planNextAction(userGoal, screenshot, context = "", screenSize = { width: 1920, height: 1080 }) {
+    try {
+        // [NEW] ⚡️ HARD LOOP DETECTION (Force Tab Fallback)
+        // User Logic: If we are interacting with the same screen area repeatedly, FORCE TAB.
+        // Fixes: "Move -> Click -> Move -> Click" loops where 'consecutiveMoves' fails.
+        if (actionHistory.length >= 3) {
+            let recentActions = actionHistory.slice(-5); // Look at last 5
+            let sameSpotCount = 0;
+
+            // Get the last known coordinates
+            let lastCoords = null;
+            for (let i = recentActions.length - 1; i >= 0; i--) {
+                if (recentActions[i].args && recentActions[i].args.x !== undefined) {
+                    lastCoords = recentActions[i].args;
+                    break;
+                }
+            }
+
+            // Count how many recent actions were near this spot
+            if (lastCoords) {
+                for (let act of recentActions) {
+                    if (act.args && act.args.x !== undefined) {
+                        const distanceInPixels = Math.sqrt(Math.pow(act.args.x - lastCoords.x, 2) + Math.pow(act.args.y - lastCoords.y, 2));
+                        if (distanceInPixels < CONFIG.LOOP_DETECTION_RADIUS_PX) sameSpotCount++;
+                    }
+                }
+            }
+
+            // [USER REQUEST]: REMOVED HARD TAB FALLBACK
+            // The user wants natural intelligence (shortcuts first), not hard triggers.
+            /*
+            if (sameSpotCount >= 3) {
+                console.log(`🔄 HARD LOOP DETECTED (${sameSpotCount} actions in same spot). Forcing TAB fallback.`);
+                return { action: "key", args: { key: "tab" } };
+            }
+            */
+        }
+
+        // [NEW] 🧠 Retrieve relevant memories (CONTEXTUAL LEARNING)
+        let memoryContext = "";
+        try {
+            // Search for relevant past interactions
+            const relevantMemories = await memory.search(userGoal, 5); // Increased limit
+            if (relevantMemories.length > 0) {
+                memoryContext = `
+🧠 LEARNED COORDINATES & PAST MISTAKES (MEM0):
+${relevantMemories.map(m => `   - ${m.text}`).join('\n')}
+   - USE THIS HISTORY: If a coordinate failed before (RESULT: REJECTED), DO NOT USE IT AGAIN.
+   - If a coordinate worked (RESULT: SUCCESS), USE IT.
+`;
+                console.log("🧠 Injected Contextual Memories:", relevantMemories.map(m => m.text));
+            }
+        } catch (memErr) {
+            console.error("⚠️ Memory retrieval failed:", memErr.message);
+        }
+
+        // [MODIFIED] Append protocol violation context if encountered
+        let enhancedContext = context + memoryContext;
+        if (actionHistory.some(a => a.violation)) {
+            enhancedContext += "\n\nCRITICAL WARNING: You previously violated the MOVE -> WAIT -> CLICK protocol. You MUST wait after moving before clicking.";
+        }
+        if (actionHistory.some(a => a.loop)) {
+            enhancedContext += "\n\nCRITICAL WARNING: You are LOOPING (clicking same spot). STOP. Use SCROLL or Move to a different location.";
+        }
+
+        // [NEW] FORCE CLICK AFTER MOVE
+        // Check if the IMMEDIATE last action was 'move'
+        if (actionHistory.length > 0 && actionHistory[actionHistory.length - 1].action === 'move') {
+            enhancedContext += `
+
+📢 ACTION CONTEXT: You just moved the mouse.
+            👉 IF the cursor is correctly positioned over the target (Verify visually):
+            👉 YOUR NEXT STEP MUST BE: {"action": "click", "args": {}}
+            👉 DO NOT MOVE AGAIN unless you are wildly off-target.`;
+        }
+
+        const response = await retryWithBackoff(async () => {
+            return await ai.models.generateContent({
+                model: CONFIG.MODEL_NAME,
+                systemInstruction: PLANNER_PROMPT,
+                contents: [
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                text: "Example: Open Spotlight search"
+                            }
+                        ]
+                    },
+                    {
+                        role: "model",
+                        parts: [
+                            {
+                                text: '{"action": "key_combo", "args": {"keys": "LeftCmd+Space"}}'
+                            }
+                        ]
+                    },
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                text: "Example: Analyze screenshot and position mouse in Spotlight search box"
+                            }
+                        ]
+                    },
+                    {
+                        role: "model",
+                        parts: [
+                            {
+                                text: 'I see the Spotlight search bar in the center-top. Coordinates approx (650, 335). Moving there.\n{"action": "move", "args": {"x": 650, "y": 335}}'
+                            }
+                        ]
+                    },
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                text: "Example: Open app in Chrome if not found"
+                            }
+                        ]
+                    },
+                    {
+                        role: "model",
+                        parts: [
+                            {
+                                text: 'Calculator failed to open. Will try Chrome.\n{"action": "key_combo", "args": {"keys": "cmd+b"}}'
+                            }
+                        ]
+                    },
+                    {
+                        role: "user",
+                        parts: [
+                            {
+                                inlineData: {
+                                    mimeType: "image/png",
+                                    data: screenshot
+                                }
+                            },
+                            {
+                                text: `IGNORE any terminal windows or command prompts in the screenshot. Focus ONLY on the desktop and applications.
+
+GOAL: ${userGoal}
+SCREEN RESOLUTION: ${screenSize.width}x${screenSize.height}
+ESTIMATED SCREEN CENTER: X=${Math.floor(screenSize.width / 2)}, Y=${Math.floor(screenSize.height / 2)}
+
+CONTEXT FROM PREVIOUS ATTEMPTS:
+${context}
+
+   - Press LeftCmd+Space key combination to open Spotlight search
+   - IMMEDIATELY after opening Spotlight, the focus is ALREADY in the search box.
+   - DO NOT CLICK. Clicking is unnecessary and error-prone.
+   - Action: "type" immediately with the search term.
+   - VERIFICATION: After typing, look at the screenshot to see if the text appears in the search box.
+   - IF valid text appears: Press "enter".
+   - IF text did NOT appear: Then and only then try to click.
+
+3. COORDINATE VARIATION PROTOCOL:
+   - Only relevant if "move" is actually needed.
+
+4. HONESTY VERIFICATION PROTOCOL:
+   - Verify if typed text is visible.
+
+5. CONTEXT AWARENESS:
+   - If "type" failed to produce text, then switch strategy to "move" + "click".
+13. NEVER move to the next step unless you can verify the current step worked with visual confirmation
+
+FINAL REMINDER:
+- "click" action MUST have empty args: "args": {}
+- TO CLICK NOW: {"action": "click", "args": {}}
+
+Determine the NEXT SINGLE ACTION needed to achieve this goal. Follow the mandatory verification protocols.`
+                            }
+                        ]
+                    }
+                ]
+            });
+        });
+
+        const text = response.candidates[0].content.parts[0].text;
+        console.log("🧠 Planner says:", text);
+
+        // Extract JSON with multiple strategies
+        let actionPlan = extractJSON(text);
+
+        // [DISABLED] 🕵️ VERIFICATION DISABLED AS PER USER REQUEST
+        // if (actionPlan) {
+        //     console.log("🕵️ Verifying plan:", actionPlan);
+        //     const verification = await verifyAction(userGoal, screenshot, actionPlan);
+        //
+        //     if (verification && verification.status === "REJECTED") {
+        //         console.log(`❌ VERIFIER REJECTED: ${verification.reason}`);
+        //         // ... functionality disabled ...
+        //     }
+        // }
+
+        if (!actionPlan) {
+            console.log("❌ No valid JSON found, using wait");
+            actionPlan = { action: "wait", args: { ms: 1000 } };
+        }
+
+        console.log("🎯 Action plan:", actionPlan);
+        return actionPlan;
+
+    } catch (error) {
+        console.error("❌ Planner error:", error.message);
+        return { action: "wait", args: { ms: 1000 } };
+    }
+}
+
+// 🎹 Helper: Check if key combination is a Spotlight trigger
+function isSpotlightTrigger(keyCombination) {
+    const triggers = ['cmd+space', 'command+space', 'leftcmd+space', 'rightcmd+space'];
+    const lowerKeys = (keyCombination || "").toLowerCase();
+    return triggers.some(trigger => lowerKeys.includes(trigger));
+}
+
+// 🎹 Helper: Handle Spotlight opening sequence
+async function handleSpotlightOpening() {
+    global.spotlightJustOpened = true;
+    console.log("✨ SPOTLIGHT OPENED - Flag set for AI to consider space.");
+    await tools.wait({ ms: CONFIG.SPOTLIGHT_DELAY_MS });
+}
+
+// 🦾 DIRECT EXECUTOR - Maps action plan directly to tool calls
+async function executeActionDirect(actionPlan) {
+    if (global.spotlightJustOpened) {
+        console.log("🎯 Spotlight just opened. Forcing backspace and then space.");
+        await tools.key({ key: "backspace" }); // Hardcoded backspace (delete on Mac)
+        await tools.key({ key: "space" });    // Hardcoded space
+        global.spotlightJustOpened = false;
+        // This ensures the planner's *intended* next action (e.g., type) still happens.
+        // The forced backspace and space will occur *before* the planner's next action.
+    }
+    try {
+        let { action, args } = actionPlan;
+
+        // 🛡️ JITTER GUARD (Micro-Move Auto-Correction) 🛡️
+        // User Request: "u fixed nothing" -> Agent is stuck in a loop of tiny mouse adjustments.
+        // Fix: If Agent moves < JITTER_THRESHOLD_PX pixels immediately after another move, assume it wants to click.
+        if (action === 'move' && lastActionType === 'move' && lastActionArgs && lastActionArgs.x !== undefined && lastActionArgs.y !== undefined) {
+            const movementDistance = Math.sqrt(Math.pow(args.x - lastActionArgs.x, 2) + Math.pow(args.y - lastActionArgs.y, 2));
+            if (movementDistance < CONFIG.JITTER_THRESHOLD_PX) {
+                console.log(`✨ JITTER GUARD: Micro-move detected (${movementDistance.toFixed(1)}px). Converting to CLICK.`);
+
+                // 1. Execute the lingering move first (to be precise)
+                await tools.move({ x: args.x, y: args.y });
+
+                // 2. FORCE CLICK
+                console.log("🦾 Auto-Clicking target...");
+                await tools.click();
+                await tools.take_screenshot();
+
+                // 3. Update History & Return Trigger
+                actionHistory.push({ action: 'move', args: args, result: 'jitter_corrected_to_click' });
+                actionHistory.push({ action: 'click', args: {}, result: 'auto_clicked' });
+
+                return {
+                    success: true,
+                    message: `✅ JITTER FIX: You moved very slightly (${dist.toFixed(1)}px). I assumed you meant to CLICK, so I clicked for you.\nNext, proceed to the verification step.`
+                };
+            }
+        }
+
+        // 🛡️ STRICT CLICK SYNTAX ENFORCEMENT 🛡️
+
+        // CASE 1: INVALID USAGE -> `click(x,y)`
+        // The tool definition DOES NOT support coordinates. We must trap this here.
+        if (action === 'click' && (args.x !== undefined || args.y !== undefined)) {
+            console.log(`⚠️ STRICT MODE: Agent tried click(${args.x}, ${args.y}). Converting to MOVE.`);
+
+            // A. Execute MOVE instead
+            await tools.move({ x: args.x, y: args.y });
+
+            // B. Optional: Crosshair Verify (Good practice, keep it)
+            try {
+                try { await tools.key({ key: 'escape' }); } catch (e) { console.debug('Escape key failed:', e.message); }
+                await tools.key_combo({ keys: 'command+shift+4' });
+                await tools.wait({ ms: 1000 });
+                await tools.take_screenshot();
+                await tools.key({ key: 'escape' });
+            } catch (e) {
+                console.error('⚠️ Verification error (continuing):', e.message);
+            }
+
+            // Record intent but mark as converted
+            actionHistory.push({ action: 'click', args: { x: args.x, y: args.y }, result: 'syntax_correction_move' });
+
+            return {
+                success: true,
+                message: `⚠️ SYNTAX WARNING: 'click' DOES NOT accept coordinates.\nI have executed 'move(${args.x}, ${args.y})' for you.\n\n❌ WRONG: {"action": "click", "args": {"x": ${args.x}, "y": ${args.y}}}
+✅ CORRECT:\nStep 1: {"action": "move", "args": {"x": ${args.x}, "y": ${args.y}}}
+Step 2: {"action": "click", "args": {}}
+
+PLEASE NOW SEND STEP 2 (Click with NO ARGS).`
+            };
+        }
+
+        // CASE 2: VALID USAGE -> `click()` (No Args)
+        if (action === 'click' && (args.x === undefined && args.y === undefined)) {
+            console.log("✅ Strict Mode: Valid 'click' (no args) received.");
+            const result = await tools.click();
+            await tools.take_screenshot();
+            actionHistory.push({ action: 'click', args: {}, result: 'clicked' });
+            return { success: true, message: "✅ CLICKED." };
+        }
+
+        // Update Global State
+        lastActionType = action;
+        lastActionArgs = args;
+        actionHistory.push({ action, args, timestamp: Date.now() });
+
+        // Keep history manageable
+        if (actionHistory.length > CONFIG.ACTION_HISTORY_LIMIT) actionHistory.shift();
+
+        // Handle action name variations
+        if (action === 'key_press' || action === 'press_key') {
+            if (args.key === 'enter') {
+                action = 'enter';
+                args = {};
+            } else if (args.key === 'tab') {
+                action = 'tab';
+                args = {};
+            } else if (args.key === 'escape') {
+                action = 'escape';
+                args = {};
+            } else if (args.key === 'space') {
+                action = 'space';
+                args = {};
+            } else if (args.key === 'backspace') {
+                action = 'backspace';
+                args = {};
+            } else {
+                action = 'key';
+                args = { key: args.key };
+            }
+        }
+
+        // 0.6 SCROLL TOOL HIJACK (Force Page Keys - NO INVERSION)
+        // User Request: "force ai to use scroll only when key combo pagedown or pageup doesnot work"
+        // Fix: "dont apply the inverse logic in this"
+        if (action === 'scroll') {
+            console.log("🛑 GUARD RAIL: Hijacking 'scroll' tool -> Redirecting to Page Keys (Standard Logic)");
+
+            let keyToPress = 'pagedown'; // Default to down
+
+            // Check args to determine direction
+            if (args.direction === 'up' || (args.amount && args.amount < 0)) {
+                keyToPress = 'pageup';
+            }
+
+            // DIRECT EXECUTION (Bypassing downstream logic to avoid double-inversion)
+            if (tools.key) {
+                const result = await tools.key({ key: keyToPress });
+                console.log(`✅ Hijack Result: Pressed ${keyToPress} instead of scrolling`);
+
+                // Record context manually since we return early
+                lastActionType = 'key';
+                lastActionArgs = { key: keyToPress };
+                actionHistory.push({ action: 'key', args: { key: keyToPress }, timestamp: Date.now() });
+
+                // Screenshot update
+                await tools.take_screenshot();
+                return result;
+            }
+        }
+
+        // 🔄 INVERSE SCROLLING LOGIC (Natural Scrolling)
+        // User Request: "scroll the opposite if the ai says down then do up and visa versa"
+        if (action === 'key') {
+            if (args.key === 'pagedown' || args.key === 'down') {
+                console.log("🔄 SCROLL INVERSION: 'Down' command -> Pressing 'PageUp' (Natural Scroll)");
+                args.key = 'pageup';
+            } else if (args.key === 'pageup' || args.key === 'up') {
+                console.log("🔄 SCROLL INVERSION: 'Up' command -> Pressing 'PageDown' (Natural Scroll)");
+                args.key = 'pagedown';
+            }
+        }
+
+        console.log(`🦾 Executing: ${action}(${JSON.stringify(args)})`);
+        if (tools[action]) {
+            // [NEW] Granular Status Logging
+            console.log(`STATUS: Executing ${action} ${JSON.stringify(args)}`);
+
+            // [SPOTLIGHT AUTO-SPACE] Check if opening Spotlight BEFORE execution
+            if (action === 'key_combo') {
+                const keyCombination = (args.keys || "").toLowerCase();
+                if (isSpotlightTrigger(keyCombination)) {
+                    console.log("🎯 Detected Spotlight trigger - will press space after opening");
+                }
+            }
+
+            const result = await tools[action](args);
+            console.log("✅ Tool result:", result);
+
+            // [NEW] Fixed Automatic Space after Spotlight
+            // User requested: "make it also work ... showing small grey text"
+
+
+            // Auto Update Status for Verification
+            if (action === 'type') {
+                console.log(`STATUS: Typing " ${args.text}"...`);
+            }
+            if (action === 'click') {
+                console.log("STATUS: Clicking...");
+            }
+
+            // Take screenshot after action (except for wait and screenshot)
+            if (action !== 'wait' && action !== 'take_screenshot') {
+                console.log("STATUS: Verifying screen state...");
+                await tools.take_screenshot();
+            }
+
+            if (action === 'key_combo') {
+                const keyCombination = (args.keys || "").toLowerCase();
+                // Check if it's opening spotlight (cmd+space variants)
+                if (isSpotlightTrigger(keyCombination)) {
+                    console.log("🔔 Spotlight opened via key_combo - executing auto-space sequence...");
+                    await handleSpotlightOpening();
+                }
+            }
+
+            return true;
+        } else if (action === 'stop') {
+            return { stop: true };
+        } else if (action === 'ask_user') {
+            console.log(`🗣️ Asking user: ${args.question}`);
+            if (tools.notify) await tools.notify({ title: "AI Agent Needs Input", message: args.question });
+            return { stop: true, ask_user: true, question: args.question };
+        } else {
+            console.log("❌ Unknown action:", action);
+            return false;
+        }
+
+    } catch (error) {
+        console.error("❌ Execution error:", error.message);
+        return false;
+    }
+
+
+}
+
+// 🔧 Helper function to extract JSON from text
+function extractJSON(text) {
+    // Strategy 1: Code block
+    const codeMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (codeMatch) {
+        try {
+            return JSON.parse(codeMatch[1]);
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    // Strategy 2: Find first { and try to parse
+    const firstBrace = text.indexOf('{');
+    if (firstBrace !== -1) {
+        let currentText = text.substring(firstBrace);
+        // Try to verify if it's a valid JSON by counting braces or just try parsing
+        // Simple approach: stack counter
+        let stack = 0;
+        let endIndex = -1;
+        let inString = false;
+        let escape = false;
+
+        for (let i = 0; i < currentText.length; i++) {
+            const char = currentText[i];
+
+            if (escape) {
+                escape = false;
+                continue;
+            }
+
+            if (char === '\\') {
+                escape = true;
+                continue;
+            }
+
+            if (char === '"' && !escape) {
+                inString = !inString;
+                continue;
+            }
+
+            if (!inString) {
+                if (char === '{') {
+                    stack++;
+                } else if (char === '}') {
+                    stack--;
+                    if (stack === 0) {
+                        endIndex = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (endIndex !== -1) {
+            const jsonStr = currentText.substring(0, endIndex + 1);
+            try {
+                const parsed = JSON.parse(jsonStr);
+                if (parsed.action) return parsed;
+            } catch (e) {
+                // ignore
+            }
+        }
+    }
+
+    return null;
+}
+
+// 🔁 MAIN AGENT FUNCTION
+async function runAgent(userGoal, context = "") {
+    // 📸 ALWAYS take a fresh screenshot first to ensure state is current
+    // This fixes the ENOENT error when running from Electron (which doesn't pre-capture)
+    await tools.take_screenshot();
+
+    const imageBase64 = fs.readFileSync(path.join(os.tmpdir(), "agent_screen.png"), "base64");
+    const screenSize = await tools.get_screen_size();
+
+    // Step 1: Plan the action
+    const actionPlan = await planNextAction(userGoal, imageBase64, context, screenSize);
+
+    // Step 2: Execute the action directly
+    const result = await executeActionDirect(actionPlan);
+
+    // Check for stop signal
+    if (result && result.stop) {
+        return { success: true, actionPlan, stop: true };
+    }
+
+    return { success: result, actionPlan };
+}
+
+export default runAgent;

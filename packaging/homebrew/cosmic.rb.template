@@ -1,0 +1,23 @@
+class Cosmic < Formula
+  desc "Cosmic AI local agent CLI"
+  homepage "https://github.com/TeeyanshShukla/Cosmic"
+  version "REPLACE_VERSION"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/TeeyanshShukla/Cosmic/releases/download/v#{version}/cosmic-darwin-arm64.tar.gz"
+      sha256 "REPLACE_SHA_ARM64"
+    else
+      url "https://github.com/TeeyanshShukla/Cosmic/releases/download/v#{version}/cosmic-darwin-x64.tar.gz"
+      sha256 "REPLACE_SHA_X64"
+    end
+  end
+
+  def install
+    bin.install Dir["cosmic*"][0] => "cosmic"
+  end
+
+  test do
+    assert_match "Cosmic CLI", shell_output("#{bin}/cosmic help")
+  end
+end

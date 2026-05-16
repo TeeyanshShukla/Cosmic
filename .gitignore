@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build artifacts
+dist/
+build/*.dmg
+build/*.zip
+build/cosmic*
+
+# runtime/logs
+*.log
+.bot-monitor.pid
+
+# local env/config
+.env
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# temporary files
+*.bak
+*.backup
+*.blockmap

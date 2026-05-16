@@ -1,0 +1,105 @@
+╔════════════════════════════════════════════════════════════════╗
+║          🤖 TELEGRAM BOT - QUICK START CHECKLIST               ║
+╚════════════════════════════════════════════════════════════════╝
+
+✅ SETUP (5 minutes)
+
+Step 1: Get Bot Token
+  → Open Telegram → Search @BotFather → Send /newbot
+  → Copy token: ___________________________
+
+Step 2: Get Your User ID  
+  → Open Telegram → Search @userinfobot → Start chat
+  → Your ID: ___________________________
+
+Step 3: Update .env File
+  TELEGRAM_BOT_TOKEN="<paste_token_here>"
+  TELEGRAM_ADMIN_IDS="<paste_user_id_here>"
+
+Step 4: Run Bot
+  cd ~/Desktop/"back of bacup"/backup/computer-use-agent
+  node telegram-bot.js
+
+✅ Test: Send /help to your bot
+
+
+╔════════════════════════════════════════════════════════════════╗
+║                    📱 COMMAND CHEAT SHEET                      ║
+╚════════════════════════════════════════════════════════════════╝
+
+AGENT CONTROL:
+  /run Search on Google: What is AI
+  /run Open Safari
+  /screenshot
+
+FILE OPERATIONS:
+  /find AI_Notes
+  /notes
+  /get /Users/you/Documents/file.txt
+
+HELP:
+  /help
+  /start
+
+
+╔════════════════════════════════════════════════════════════════╗
+║                    🎯 WORKFLOW EXAMPLES                        ║
+╚════════════════════════════════════════════════════════════════╝
+
+WORKFLOW 1: Remote Command
+  You:  /run Search on Google: "AI Desktop Agent"
+  Bot:  ⏳ Executing: "Search on Google: AI Desktop Agent"
+  Bot:  ✅ Task completed successfully!
+
+WORKFLOW 2: Get Notes
+  You:  /notes
+  Bot:  ✅ Found 3 note file(s): AI_Notes.md, Research.pdf, Ideas.txt
+  Bot:  📄 AI_Notes.md (auto-sent)
+  Bot:  📄 Research.pdf (auto-sent)
+  Bot:  📄 Ideas.txt (auto-sent)
+
+WORKFLOW 3: Find & Download
+  You:  /find important_document
+  Bot:  ✅ Found 2 file(s):
+        1. /Users/you/Documents/important_document.pdf
+
+  You:  /get /Users/you/Documents/important_document.pdf
+  Bot:  📤 Sending: important_document.pdf (2.5 MB)
+  Bot:  📄 important_document.pdf
+
+
+╔════════════════════════════════════════════════════════════════╗
+║                    🔧 TROUBLESHOOTING                          ║
+╚════════════════════════════════════════════════════════════════╝
+
+❌ "TELEGRAM_BOT_TOKEN not set"
+   → Check .env file has correct token (no extra quotes)
+
+❌ "Not authorized"  
+   → Your User ID doesn't match TELEGRAM_ADMIN_IDS
+   → Send /start to bot to see your ID
+
+❌ Bot doesn't respond
+   → Check if running: ps aux | grep telegram-bot
+   → Restart: node telegram-bot.js
+
+❌ File not found
+   → Use /find first to get exact path
+   → Make sure path starts with /Users/
+
+
+╔════════════════════════════════════════════════════════════════╗
+║              🚀 KEEP BOT RUNNING 24/7 (Optional)               ║
+╚════════════════════════════════════════════════════════════════╝
+
+Option A: Background Process
+  nohup node telegram-bot.js > telegram-bot.log 2>&1 &
+
+Option B: PM2 (Recommended)
+  npm install -g pm2
+  pm2 start telegram-bot.js --name "ai-agent-bot"
+  pm2 save
+  pm2 startup
+
+
+✅ You're all set! Start using your Telegram bot! 🎉

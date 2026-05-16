@@ -1,0 +1,481 @@
+import { mouse, keyboard, screen, Key } from "@nut-tree-fork/nut-js";
+import screenshot from "screenshot-desktop";
+import { execFileSync } from "child_process";
+import path from "path";
+import os from "os";
+import fs from "fs";
+import { GoogleGenAI } from "@google/genai";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const SCREEN_PATH = path.join(os.tmpdir(), "agent_screen.png");
+
+// Helper for shortcut lookup
+async function queryShortcut(appName, intention) {
+    try {
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        const model = ai.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
+
+        const prompt = `You are a Mac Shortcut Expert.
+        User wants to perform the action: "${intention}" in the app: "${appName}".
+        Return ONLY the keyboard shortcut string compatible with nut.js / active-window interactions.
+        Examples: "cmd+k", "opt+cmd+s", "ctrl+c", "space", "f5".
+        If no standard shortcut exists, return "null".
+        DO NOT explain. ONLY output the string.`;
+
+        const result = await model.generateContent(prompt);
+        return result.response.text().trim();
+    } catch (e) {
+        console.error("Shortcut Lookup Error:", e);
+        return null;
+    }
+}
+
+
+// Record step execution with timing
+async function recordToolExecution(toolName, args, resultFn) {
+    const startTime = Date.now();
+    try {
+        const result = await resultFn();
+        const duration = Date.now() - startTime;
+        
+        if (global.stepTracker) {
+            global.stepTracker.recordStep(
+                toolName,
+                args,
+                result,
+                duration,
+                { validated: true }
+            );
+        }
+        
+        return result;
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        
+        if (global.stepTracker) {
+            global.stepTracker.recordStep(
+                toolName,
+                args,
+                null,
+                duration,
+                { error: error.message, validated: false }
+            );
+        }
+        
+        throw error;
+    }
+}
+
+
+export const tools = {
+    take_screenshot: async () => {
+        try {
+            await screenshot({ filename: SCREEN_PATH });
+            return "screenshot taken";
+        } catch (e) {
+            console.error("❌ Screenshot Failed:", e.message);
+            if (e.message.includes("could not create image")) {
+                console.error("⚠️ PERMISSION DENIED: Please grant 'Screen Recording' permission to Terminal/VSCode in System Settings.");
+                return "FAILED: Permission Denied (Screen Recording)";
+            }
+            return "failed to take screenshot";
+        }
+    },
+
+    click: async () => {
+        try {
+            console.log("🖱️ Clicking at current position");
+            await mouse.leftClick();
+            return "clicked";
+        } catch (e) {
+            console.error("Mouse Error:", e.message);
+            return "failed to click";
+        }
+    },
+
+    move: async ({ x, y }) => {
+        try {
+            const posX = parseInt(x, 10);
+            const posY = parseInt(y, 10);
+            if (isNaN(posX) || isNaN(posY)) {
+                return `error: invalid coordinates x=${x}, y=${y}`;
+            }
+            console.log(`🖱️ Moving mouse to (${posX}, ${posY})`);
+            await mouse.setPosition({ x: posX, y: posY });
+            return "moved";
+        } catch (e) {
+            console.error("Move Error:", e.message);
+            return "failed to move";
+        }
+    },
+
+    type: async ({ text }) => {
+        if (!text || typeof text !== 'string') {
+            return "error: text must be a non-empty string";
+        }
+        try {
+            await keyboard.type(text);
+            return "typed";
+        } catch (e) {
+            console.error("Type Error:", e.message);
+            return `failed to type: ${e.message}`;
+        }
+    },
+
+    scroll: async ({ x, y }) => {
+        if (typeof y !== 'number' || !Number.isFinite(y)) {
+            return "error: y must be a valid number";
+        }
+        try {
+            await mouse.scrollDown(Math.abs(y) || 3);
+            return "scrolled";
+        } catch (e) {
+            console.error("Scroll Error:", e.message);
+            return `failed to scroll: ${e.message}`;
+        }
+    },
+
+    wait: async ({ ms, seconds }) => {
+        const waitTime = ms || (seconds * 1000) || 1000;
+        await new Promise(r => setTimeout(r, waitTime));
+        return "waited";
+    },
+
+    // 🎹 NEW KEYBOARD FUNCTIONS
+    key: async ({ key }) => {
+        const keyLower = key.toLowerCase();
+
+        const keyMap = {
+            'space': Key.Space,
+            'enter': Key.Return,
+            'return': Key.Return,
+            'tab': Key.Tab,
+            'escape': Key.Escape,
+            'esc': Key.Escape,
+            'backspace': Key.BackSpace,
+            'delete': Key.Delete,
+            'up': Key.Up,
+            'down': Key.Down,
+            'left': Key.Left,
+            'right': Key.Right,
+            'f4': Key.F4,
+            'pageup': Key.PageUp,
+            'pagedown': Key.PageDown,
+        }
+
+
+        const mappedKey = keyMap[keyLower] || key;
+        await keyboard.pressKey(mappedKey);
+        return `pressed ${key}`;
+    },
+
+    key_combo: async ({ keys }) => {
+        // Handle key combinations like "cmd+c", "ctrl+v", etc.
+        const keyArray = keys.split('+').map(k => k.trim());
+
+        // Map common key names to nut.js Key constants
+        const keyMap = {
+            'cmd': Key.LeftCmd,
+            'leftcmd': Key.LeftCmd,
+            'LeftCmd': Key.LeftCmd,
+            'rightcmd': Key.RightCmd,
+            'RightCmd': Key.RightCmd,
+            'command': Key.LeftCmd,
+            'ctrl': Key.LeftControl,
+            'leftctrl': Key.LeftControl,
+            'rightctrl': Key.RightControl,
+            'control': Key.LeftControl,
+            'alt': Key.LeftAlt,
+            'leftalt': Key.LeftAlt,
+            'rightalt': Key.RightAlt,
+            'shift': Key.LeftShift,
+            'leftshift': Key.LeftShift,
+            'rightshift': Key.RightShift,
+            'space': Key.Space,
+            'Space': Key.Space,
+            'esc': Key.Escape,
+            'escape': Key.Escape,
+            'return': Key.Return,
+            'enter': Key.Return,
+            'tab': Key.Tab,
+            'backspace': Key.BackSpace,
+            'delete': Key.Delete,
+            'up': Key.Up,
+            'down': Key.Down,
+            'left': Key.Left,
+            'right': Key.Right,
+            'home': Key.Home,
+            'end': Key.End,
+            'pageup': Key.PageUp,
+            'pagedown': Key.PageDown,
+            'f1': Key.F1,
+            'f2': Key.F2,
+            'f3': Key.F3,
+            'f4': Key.F4,
+            'f5': Key.F5,
+            'f6': Key.F6,
+            'f7': Key.F7,
+            'f8': Key.F8,
+            'f9': Key.F9,
+            'f10': Key.F10,
+            'f11': Key.F11,
+            'f12': Key.F12
+        };
+
+        // Convert keys to nut.js Key constants
+        const mappedKeys = keyArray.map(key => {
+            const trimmedKey = key.trim();
+            if (keyMap[trimmedKey]) {
+                return keyMap[trimmedKey];
+            }
+            // For single characters, return as string
+            return trimmedKey;
+        });
+
+        console.log(`🎹 Pressing key combination: ${keys} -> ${mappedKeys.map(k => k.name || k).join(' + ')}`);
+
+        // Press all keys together as combination
+        await keyboard.pressKey(...mappedKeys);
+
+        return `pressed ${keys}`;
+    },
+
+    enter: async () => {
+        await keyboard.pressKey(Key.Return);
+        return "pressed enter";
+    },
+
+    tab: async () => {
+        await keyboard.pressKey(Key.Tab);
+        return "pressed tab";
+    },
+
+    escape: async () => {
+        await keyboard.pressKey(Key.Escape);
+        return "pressed escape";
+    },
+
+    backspace: async () => {
+        await keyboard.pressKey(Key.BackSpace);
+        return "pressed backspace";
+    },
+
+    space: async () => {
+        await keyboard.pressKey(Key.Space);
+        return "pressed space";
+    },
+
+    get_screen_size: async () => {
+        const width = await screen.width();
+        const height = await screen.height();
+        return { width, height };
+    },
+
+    notify: async ({ title, message }) => {
+        try {
+            if (!title || !message) {
+                return "error: title and message required";
+            }
+            console.log(`🔔 Notification: ${title} - ${message}`);
+            const safeTitle = String(title).replace(/"/g, '\\"').replace(/\$/g, '\\$');
+            const safeMessage = String(message).replace(/"/g, '\\"').replace(/\$/g, '\\$');
+            execFileSync("osascript", ["-e", `display notification "${safeMessage}" with title "${safeTitle}"`]);
+            return "notification sent";
+        } catch (e) {
+            console.error("Notify Error:", e.message);
+            return "failed to notify";
+        }
+    },
+
+    find_shortcuts: async ({ app_name, intention }) => {
+        console.log(`🔍 Looking up shortcut for "${intention}" in "${app_name}"...`);
+        const shortcut = await queryShortcut(app_name, intention);
+
+        if (shortcut && shortcut !== "null") {
+            console.log(`✅ Found Shortcut: ${shortcut}`);
+            return `FOUND: ${shortcut}`;
+        } else {
+            console.log("❌ No shortcut found.");
+            return "NOT_FOUND";
+        }
+    },
+
+    // 📁 FILE OPERATIONS
+    file_operation: async ({ type, path: filepath, name }) => {
+        try {
+            if (type === 'create_folder') {
+                const expandedPath = filepath.replace('~', os.homedir());
+                if (!fs.existsSync(expandedPath)) {
+                    fs.mkdirSync(expandedPath, { recursive: true });
+                    console.log(`✅ Folder created: ${expandedPath}`);
+                    return `created folder: ${expandedPath}`;
+                } else {
+                    console.log(`ℹ️ Folder already exists: ${expandedPath}`);
+                    return `folder already exists: ${expandedPath}`;
+                }
+            } else if (type === 'delete_file') {
+                const expandedPath = filepath.replace('~', os.homedir());
+                if (fs.existsSync(expandedPath)) {
+                    fs.unlinkSync(expandedPath);
+                    console.log(`✅ File deleted: ${expandedPath}`);
+                    return `deleted file: ${expandedPath}`;
+                } else {
+                    return `file not found: ${expandedPath}`;
+                }
+            } else if (type === 'list_files') {
+                const expandedPath = filepath.replace('~', os.homedir());
+                const files = fs.readdirSync(expandedPath);
+                console.log(`📋 Files in ${expandedPath}:`, files);
+                return `found ${files.length} files: ${files.join(', ')}`;
+            }
+            return "unknown file operation";
+        } catch (e) {
+            console.error("File Operation Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+    // 🖥️ APP SWITCHING
+    switch_app: async ({ app_name }) => {
+        try {
+            console.log(`🔄 Switching to ${app_name}...`);
+            const script = `activate application "${app_name}"`;
+            execFileSync('osascript', ['-e', script]);
+            console.log(`✅ Switched to ${app_name}`);
+            return `switched to ${app_name}`;
+        } catch (e) {
+            console.error("App Switch Error:", e.message);
+            return `failed to switch: ${e.message}`;
+        }
+    },
+
+    // 🎬 APPLESCRIPT EXECUTION
+    execute_script: async ({ script, type }) => {
+        try {
+            if (type !== 'applescript' && type !== 'shell') {
+                return `error: type must be 'applescript' or 'shell'`;
+            }
+            
+            console.log(`⚙️ Executing ${type}: ${script.substring(0, 50)}...`);
+            const result = execFileSync('osascript', ['-e', script], { encoding: 'utf-8' });
+            console.log(`✅ Script executed`);
+            return `executed: ${result.trim()}`;
+        } catch (e) {
+            console.error("Script Execution Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+    // ⏱️ CONDITIONAL WAIT
+    wait_for: async ({ condition, timeout, app_name, text }) => {
+        try {
+            const timeoutMs = timeout || 5000;
+            const startTime = Date.now();
+            
+            console.log(`⏳ Waiting for condition: ${condition} (${timeoutMs}ms timeout)...`);
+            
+            if (condition === 'app_visible') {
+                // Check if app window is visible
+                const script = `tell application "System Events"
+                    return (exists window of application "${app_name}")
+                end tell`;
+                
+                while (Date.now() - startTime < timeoutMs) {
+                    try {
+                        const result = execFileSync('osascript', ['-e', script], { encoding: 'utf-8' });
+                        if (result.includes('true')) {
+                console.log(`✅ App "${app_name}" is now visible`);
+                            return `app visible: ${app_name}`;
+                        }
+                    } catch (e) {
+                        // App not visible yet
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                return `timeout: app "${app_name}" not visible after ${timeoutMs}ms`;
+            }
+            
+            return `unknown condition: ${condition}`;
+        } catch (e) {
+            console.error("Wait Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+
+    // 🖥️ OPEN APP - Terminal: open -a "AppName"
+    open_app: async ({ app_name }) => {
+        try {
+            if (!app_name) return "error: app_name required";
+            console.log(`🚀 Opening app: ${app_name}`);
+            const { execSync } = require('child_process');
+            execSync(`open -a "${app_name}"`, { stdio: 'pipe' });
+            console.log(`✅ Opened: ${app_name}`);
+            return `app_opened: ${app_name}`;
+        } catch (e) {
+            console.error("Open App Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+    // 🔍 MDFIND - Terminal: mdfind query
+    mdfind: async ({ query, type }) => {
+        try {
+            if (!query) return "error: query required";
+            console.log(`🔎 Searching with mdfind: ${query}`);
+            const { execSync } = require('child_process');
+            let cmd = `mdfind "${query}"`;
+            if (type === 'apps') {
+                cmd = `mdfind "kMDItemContentType == 'com.apple.application-bundle' && kMDItemFSName == '*${query}*'"`;
+            }
+            const result = execSync(cmd, { encoding: 'utf-8' });
+            const lines = result.trim().split('\n');
+            console.log(`✅ Found ${lines.length} results`);
+            return `search_results: ${lines.slice(0, 5).join(', ')}`;
+        } catch (e) {
+            console.error("mdfind Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+    // 🌐 OPEN URL - Terminal: open "url"
+    open_url: async ({ url }) => {
+        try {
+            if (!url) return "error: url required";
+            if (!url.startsWith('http')) {
+                url = 'https://' + url;
+            }
+            console.log(`🌐 Opening URL: ${url}`);
+            const { execSync } = require('child_process');
+            execSync(`open "${url}"`, { stdio: 'pipe' });
+            console.log(`✅ Opened in browser: ${url}`);
+            return `url_opened: ${url}`;
+        } catch (e) {
+            console.error("Open URL Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    },
+
+    // 🔍 SPOTLIGHT SEARCH VIA OSASCRIPT (Terminal-based)
+
+    // 🔍 SPOTLIGHT SEARCH VIA OSASCRIPT
+    spotlight_search: async ({ query }) => {
+        try {
+            if (!query || typeof query !== 'string') {
+                return "error: query must be a non-empty string";
+            }
+            console.log(`🔍 Opening Spotlight and searching for: ${query}`);
+            execFileSync('osascript', ['-e', 'tell application "System Events" to key code 49 using command down']);
+            await new Promise(r => setTimeout(r, 500)); // Wait for spotlight to open
+            await keyboard.type(query);
+            return `searched for ${query} in Spotlight`;
+        } catch (e) {
+            console.error("Spotlight Search Error:", e.message);
+            return `failed: ${e.message}`;
+        }
+    }
+};
+
+export default tools;

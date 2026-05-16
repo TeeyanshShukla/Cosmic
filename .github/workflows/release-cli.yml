@@ -1,0 +1,73 @@
+name: Release Cosmic CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build CLI binary
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            npm run pkg:mac
+            mv build/cosmic-macos-arm64 build/cosmic-darwin-arm64 || true
+            mv build/cosmic-macos-x64 build/cosmic-darwin-x64 || true
+          else
+            npm run pkg:linux
+            mv build/cosmic-linux-linux build/cosmic-linux-x64 || true
+          fi
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            tar -czf release/cosmic-darwin-arm64.tar.gz -C build cosmic-darwin-arm64
+            tar -czf release/cosmic-darwin-x64.tar.gz -C build cosmic-darwin-x64
+          else
+            tar -czf release/cosmic-linux-x64.tar.gz -C build cosmic-linux-x64
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmic-${{ runner.os }}
+          path: release/*
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/**
+          generate_release_notes: true
