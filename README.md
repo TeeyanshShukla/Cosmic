@@ -119,4 +119,10 @@ npm run pkg:all
 
 ## License
 
-MIT
+Copyright (c) 2026 Teeyansh Shukla. All rights reserved.
+
+This software and associated source code are proprietary and confidential.
+
+No permission is granted to use, copy, modify, merge, publish, distribute, sublicense, sell, or create derivative works from this software without explicit written permission from the copyright holder.
+
+Unauthorized use, reproduction, or distribution is strictly prohibited.
