@@ -32,11 +32,8 @@ jobs:
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             npm run pkg:mac
-            mv build/cosmic-macos-arm64 build/cosmic-darwin-arm64 || true
-            mv build/cosmic-macos-x64 build/cosmic-darwin-x64 || true
           else
             npm run pkg:linux
-            mv build/cosmic-linux-linux build/cosmic-linux-x64 || true
           fi
 
       - name: Package artifacts
